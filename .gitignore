@@ -1,0 +1,23 @@
+# פרטים אישיים - לעולם לא להעלות
+env.txt
+.env
+
+# session מחובר של הדפדפן (עוגיות התחברות)
+browser_profile/
+
+# נתונים שנוצרים בריצה (מכילים פרטי תורים)
+state.json
+watch.log
+tests/test_results.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# עורכים ומערכת
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

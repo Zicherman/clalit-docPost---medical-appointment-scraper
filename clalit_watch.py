@@ -3,7 +3,7 @@
 מעקב תורים מוקדמים בכללית -> התראה בטלגרם
 
 הרצה:
-    python clalit_watch.py                 # ריצה רציפה (בדיקה כל CHECK_EVERY_MIN דקות)
+    python clalit_watch.py                 # ריצה רציפה: בדיקה כל CHECK_EVERY_MIN דקות + פקודות בטלגרם
     python clalit_watch.py --once          # בדיקה אחת ויציאה (לבדיקה ראשונה)
     python clalit_watch.py --test-notify   # שולח הודעת בדיקה לטלגרם ויוצא (לא מתחבר לכללית)
 
@@ -142,13 +142,27 @@ def parse_date(s):
     return datetime.strptime(s, "%d.%m.%Y").date()
 
 
+STATE_DEFAULTS = {
+    "notified": [],            # תורים שכבר דווחו
+    "last_current": None,      # התור הנוכחי שלך, מהבדיקה האחרונה
+    "fail_count": 0,           # כשלונות ברצף
+    "tg_offset": None,         # העדכון הבא לקריאה מטלגרם
+    "paused_until": None,      # None = פעיל, "forever" = עד /resume, אחרת זמן ISO
+    "last_check_time": None,   # זמן ISO של הבדיקה האחרונה
+    "last_check_error": None,  # השגיאה של הבדיקה האחרונה, אם נכשלה
+}
+
+
 def load_state():
+    st = {}
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"notified": [], "last_current": None, "fail_count": 0}
+    for k, v in STATE_DEFAULTS.items():
+        st.setdefault(k, list(v) if isinstance(v, list) else v)
+    return st
 
 
 def save_state(st):
@@ -156,26 +170,33 @@ def save_state(st):
     STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def notify(env, text):
-    """שולח הודעה בטלגרם. מחזיר True אם הטלגרם אישר (ok=true)."""
-    url = f"https://api.telegram.org/bot{env['TG_TOKEN']}/sendMessage"
-    data = urllib.parse.urlencode({"chat_id": env["TG_CHAT_ID"], "text": text.replace("*", "")}).encode()
+def tg_call(env, method, params, timeout=30):
+    """קריאה ל-Telegram Bot API. מחזיר את תשובת ה-JSON. בשגיאה, ההודעה לא כוללת את הטוקן."""
+    url = f"https://api.telegram.org/bot{env['TG_TOKEN']}/{method}"
+    data = urllib.parse.urlencode(params).encode()
     try:
         try:
-            with urllib.request.urlopen(url, data=data, timeout=30) as r:
-                body = r.read().decode("utf-8", "ignore")
+            with urllib.request.urlopen(url, data=data, timeout=timeout) as r:
+                body = r.read()
         except urllib.error.HTTPError as e:  # טלגרם מחזיר JSON עם הסבר גם בשגיאות
-            body = e.read().decode("utf-8", "ignore")
-        resp = json.loads(body)
-        if resp.get("ok"):
-            log.info("Telegram נשלח")
-            return True
-        log.error("Telegram נכשל: %s", resp.get("description", body[:200]))
-        return False
+            body = e.read()
+        return json.loads(body.decode("utf-8", "ignore"))
     except Exception as e:
-        # בלי להדפיס את ה-URL, כי הטוקן נמצא בו
-        log.error("Telegram נכשל: %s", type(e).__name__)
+        raise RuntimeError(f"{type(e).__name__}: {e}".replace(env["TG_TOKEN"], "***")) from None
+
+
+def notify(env, text):
+    """שולח הודעה בטלגרם. מחזיר True אם הטלגרם אישר (ok=true)."""
+    try:
+        resp = tg_call(env, "sendMessage", {"chat_id": env["TG_CHAT_ID"], "text": text.replace("*", "")})
+    except Exception as e:
+        log.error("Telegram נכשל: %s", e)
         return False
+    if resp.get("ok"):
+        log.info("Telegram נשלח")
+        return True
+    log.error("Telegram נכשל: %s", resp.get("description"))
+    return False
 
 
 # ------------------------------------------------- JS שרץ בתוך עמוד הזימון
@@ -438,18 +459,254 @@ def check_once(browser, env, state):
     better = find_better(search_all(fr), current)
     new = [(k, v) for k, v in better if k not in state["notified"]]
     log.info("נמצאו %d תורים מוקדמים יותר, מתוכם %d חדשים", len(better), len(new))
-    if not new:
-        return
-
-    if send(build_message([v for _, v in new], cur_str)):
+    if new and send(build_message([v for _, v in new], cur_str)):
         state["notified"].extend(k for k, _ in new)
+    return len(better), len(new)
 
 
 # ------------------------------------------------------------------ main
 
-def in_active_hours():
-    h = datetime.now().hour
+POLL_TIMEOUT_S = 30   # long polling: כמה זמן getUpdates מחכה להודעה חדשה
+POLL_RETRY_S = 15     # המתנה אחרי כשלון של getUpdates (למשל אין אינטרנט)
+
+HELP_TEXT = (
+    "פקודות:\n"
+    "/status - מצב המעקב\n"
+    "/check - בדיקה עכשיו (גם בזמן השהיה)\n"
+    "/pause - השהיה עד /resume\n"
+    "/pause N - השהיה ל-N שעות\n"
+    "/resume - ביטול ההשהיה"
+)
+
+
+def in_active_hours(t=None):
+    h = (t or datetime.now()).hour
     return ACTIVE_HOURS[0] <= h < ACTIVE_HOURS[1]
+
+
+def shift_to_active_hours(t):
+    """אם t מחוץ לשעות הפעילות - מזיז אותו לתחילת חלון הפעילות הבא."""
+    start, end = ACTIVE_HOURS
+    if end - start >= 24 or in_active_hours(t):
+        return t
+    day = t if t.hour < start else t + timedelta(days=1)
+    return day.replace(hour=start, minute=0, second=0, microsecond=0)
+
+
+def fmt_time(t):
+    if t is None:
+        return "אין"
+    return t.strftime("%H:%M") if t.date() == date.today() else t.strftime("%d.%m %H:%M")
+
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(s) if s else None
+    except ValueError:
+        return None
+
+
+class Watcher:
+    """הלולאה הראשית: מטפל בפקודות טלגרם, ומריץ בדיקות ו-keep-alive בזמן. הכל ב-thread אחד."""
+
+    def __init__(self, browser, env, state):
+        self.browser, self.env, self.state = browser, env, state
+        last = parse_ts(state.get("last_check_time"))
+        interval = timedelta(minutes=CHECK_EVERY_MIN)
+        self.next_check = max(datetime.now(), last + interval) if last else datetime.now()
+        self.last_activity = datetime.now()
+
+    # ---- עזרים
+
+    def reply(self, text):
+        notify(self.env, text)
+
+    def save(self):
+        save_state(self.state)
+
+    def pause_info(self):
+        """(מושהה?, עד מתי). עד מתי = None כשההשהיה ללא הגבלה."""
+        p = self.state.get("paused_until")
+        if not p:
+            return False, None
+        if p == "forever":
+            return True, None
+        until = parse_ts(p)
+        return (until is not None), until
+
+    def next_check_at(self):
+        """מתי הבדיקה המתוזמנת הבאה תרוץ בפועל. None = מושהה ללא הגבלה."""
+        paused, until = self.pause_info()
+        if paused and until is None:
+            return None
+        t = max(self.next_check, datetime.now())
+        if until:
+            t = max(t, until)
+        return shift_to_active_hours(t)
+
+    # ---- בדיקה
+
+    def run_check(self):
+        """בדיקה אחת. מחזיר (מוקדמים, חדשים), או זורק את השגיאה אחרי שנרשמה."""
+        now = datetime.now()
+        self.state["last_check_time"] = now.isoformat(timespec="seconds")
+        try:
+            result = check_once(self.browser, self.env, self.state)
+            self.state["fail_count"] = 0
+            self.state["last_check_error"] = None
+            return result
+        except Exception as e:
+            self.state["fail_count"] = self.state.get("fail_count", 0) + 1
+            self.state["last_check_error"] = str(e)[:200]
+            log.exception("הבדיקה נכשלה (%d ברצף)", self.state["fail_count"])
+            if self.state["fail_count"] == 3:
+                notify(self.env, f"⚠️ מעקב התורים נכשל 3 פעמים ברצף. השגיאה האחרונה: {e}")
+            raise
+        finally:
+            self.save()
+            self.browser.back_to_background()
+            self.next_check = datetime.now() + timedelta(minutes=CHECK_EVERY_MIN)
+            self.last_activity = datetime.now()
+
+    # ---- פקודות
+
+    def poll_commands(self):
+        """long polling ל-getUpdates. חוזר אחרי הודעה חדשה או אחרי POLL_TIMEOUT_S."""
+        params = {"timeout": POLL_TIMEOUT_S, "allowed_updates": '["message"]'}
+        if self.state.get("tg_offset"):
+            params["offset"] = self.state["tg_offset"]
+        try:
+            resp = tg_call(self.env, "getUpdates", params, timeout=POLL_TIMEOUT_S + 15)
+            if not resp.get("ok"):
+                raise RuntimeError(resp.get("description"))
+        except Exception as e:
+            log.warning("getUpdates נכשל: %s. מנסה שוב בעוד %d שניות", e, POLL_RETRY_S)
+            time.sleep(POLL_RETRY_S)
+            return
+        for upd in resp.get("result", []):
+            # מקדמים את ה-offset לפני הטיפול, כדי שפקודה שנכשלה לא תחזור שוב ושוב
+            self.state["tg_offset"] = upd["update_id"] + 1
+            self.save()
+            msg = upd.get("message") or {}
+            if str(msg.get("chat", {}).get("id")) != str(self.env["TG_CHAT_ID"]):
+                log.warning("התעלמתי מהודעה מצ'אט לא מורשה")
+                continue
+            try:
+                self.handle_command((msg.get("text") or "").strip())
+            except Exception:
+                log.exception("טיפול בפקודה נכשל")
+
+    def handle_command(self, text):
+        parts = text.split()
+        cmd = parts[0].split("@")[0].lower() if parts else ""
+        arg = parts[1] if len(parts) > 1 else None
+        log.info("פקודה מטלגרם: %s", text[:50])
+
+        if cmd == "/pause":
+            if arg is None:
+                self.state["paused_until"] = "forever"
+                self.save()
+                self.reply("⏸️ המעקב מושהה עד שתשלח /resume.")
+                return
+            try:
+                hours = float(arg)
+                if not 0 < hours <= 24 * 365:
+                    raise ValueError
+            except ValueError:
+                self.reply("מספר השעות לא תקין. דוגמה: /pause 3")
+                return
+            until = datetime.now() + timedelta(hours=hours)
+            self.state["paused_until"] = until.isoformat(timespec="seconds")
+            self.save()
+            self.reply(f"⏸️ המעקב מושהה עד {fmt_time(until)}. אחר כך הוא יחזור לבד.")
+
+        elif cmd == "/resume":
+            if not self.pause_info()[0]:
+                self.reply(f"המעקב כבר פעיל. הבדיקה הבאה: {fmt_time(self.next_check_at())}")
+                return
+            self.state["paused_until"] = None
+            self.save()
+            self.reply(f"▶️ המעקב חזר לפעול. הבדיקה הבאה: {fmt_time(self.next_check_at())}")
+
+        elif cmd == "/status":
+            self.reply(self.status_text())
+
+        elif cmd == "/check":
+            self.reply("🔎 מריץ בדיקה עכשיו...")
+            try:
+                n_better, n_new = self.run_check()
+            except Exception as e:
+                self.reply(f"⚠️ הבדיקה נכשלה: {str(e)[:200]}")
+                return
+            if n_better == 0:
+                summary = "אין תור מוקדם מהתור שלך."
+            elif n_new:
+                summary = f"{n_better} תורים מוקדמים, מתוכם {n_new} חדשים (נשלחו בהודעה נפרדת)."
+            else:
+                summary = f"{n_better} תורים מוקדמים, כולם כבר דווחו לך קודם."
+            current = self.state.get("last_current") or "לא נמצא תור עתידי בהתמחות הזו"
+            self.reply(f"✅ הבדיקה הסתיימה. {summary}\n\nהתור הנוכחי שלך:\n{current}")
+
+        else:
+            self.reply(HELP_TEXT)
+
+    def status_text(self):
+        paused, until = self.pause_info()
+        if not paused:
+            mode = "▶️ פעיל"
+        elif until is None:
+            mode = "⏸️ מושהה עד /resume"
+        else:
+            mode = f"⏸️ מושהה עד {fmt_time(until)}"
+        last = parse_ts(self.state.get("last_check_time"))
+        last_str = fmt_time(last)
+        if last and self.state.get("last_check_error"):
+            last_str += " (נכשלה)"
+        nxt = self.next_check_at()
+        return "\n".join([
+            f"מצב: {mode}",
+            f"בדיקה אחרונה: {last_str}",
+            f"התור שלך: {self.state.get('last_current') or 'לא ידוע / אין'}",
+            f"בדיקה הבאה: {fmt_time(nxt) if nxt else 'אחרי /resume'}",
+        ])
+
+    # ---- תזמון
+
+    def tick(self):
+        """אחרי טיפול בפקודות: חזרה מהשהיה, בדיקה מתוזמנת, או keep-alive."""
+        now = datetime.now()
+        paused, until = self.pause_info()
+        if paused and until and now >= until:
+            self.state["paused_until"] = None
+            self.save()
+            paused = False
+            log.info("ההשהיה הסתיימה")
+            self.reply(f"▶️ ההשהיה הסתיימה, המעקב חזר לפעול. הבדיקה הבאה: {fmt_time(self.next_check_at())}")
+        if paused or not in_active_hours(now):
+            return
+        if now >= self.next_check:
+            try:
+                self.run_check()
+            except Exception:
+                pass  # כבר נרשם ללוג ב-run_check
+            return
+        if now - self.last_activity >= timedelta(minutes=KEEPALIVE_MIN):
+            # keep-alive שקט כדי שה-session לא יפוג בין בדיקות
+            self.last_activity = now
+            try:
+                if "e-services.clalit.co.il" in self.browser.page.url:
+                    self.browser.page.evaluate(KEEPALIVE_JS)
+            except Exception:
+                pass
+
+    def step(self):
+        self.poll_commands()
+        self.tick()
+
+    def loop(self):
+        log.info("המעקב פועל ומאזין לפקודות בטלגרם")
+        while True:
+            self.step()
 
 
 def main():
@@ -471,32 +728,15 @@ def main():
     with sync_playwright() as p:
         browser = Browser(p, show=args.show)
         try:
-            next_check = time.time()
-            while True:
-                if time.time() >= next_check:
-                    if in_active_hours() or args.once:
-                        try:
-                            check_once(browser, env, state)
-                            state["fail_count"] = 0
-                        except Exception as e:
-                            state["fail_count"] = state.get("fail_count", 0) + 1
-                            log.exception("הבדיקה נכשלה (%d ברצף)", state["fail_count"])
-                            if state["fail_count"] == 3:
-                                notify(env, f"⚠️ מעקב התורים נכשל 3 פעמים ברצף. השגיאה האחרונה: {e}")
-                        save_state(state)
-                        browser.back_to_background()
-                    else:
-                        log.info("מחוץ לשעות הפעילות")
-                    if args.once:
-                        break
-                    next_check = time.time() + CHECK_EVERY_MIN * 60
-                # keep-alive שקט כדי שה-session לא יפוג בין בדיקות
-                time.sleep(KEEPALIVE_MIN * 60 if next_check - time.time() > KEEPALIVE_MIN * 60 else max(5, next_check - time.time()))
+            watcher = Watcher(browser, env, state)
+            if args.once:
+                # בדיקה אחת בלי להאזין לפקודות (ובלי להתחשב בהשהיה או בשעות הפעילות)
                 try:
-                    if "e-services.clalit.co.il" in browser.page.url:
-                        browser.page.evaluate(KEEPALIVE_JS)
+                    watcher.run_check()
                 except Exception:
-                    pass
+                    pass  # כבר נרשם ללוג
+            else:
+                watcher.loop()
         finally:
             browser.close()
 

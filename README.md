@@ -74,31 +74,51 @@ Settings live at the top of `clalit_watch.py`:
 | `tests\test_search.bat` | Full dry run that **sends nothing**: logs in, reads your appointment, searches, and prints the message that would be sent. Output is saved to `tests/test_results.txt` |
 | `python clalit_watch.py --test-notify` | Sends a test message to Telegram |
 | `python clalit_watch.py --once` | One real check (sends to Telegram if there's a new appointment), then exits |
-| `python clalit_watch.py` | Continuous mode: checks every `CHECK_EVERY_MIN` minutes during active hours |
+| `python clalit_watch.py` | Continuous mode: checks every `CHECK_EVERY_MIN` minutes during active hours, and listens for Telegram commands |
 | `--show` | Shows the browser window (for debugging) |
 
 The log is written to `watch.log`.
 
+## Telegram commands
+
+In continuous mode you can control the bot by sending it commands in Telegram:
+
+| Command | What it does |
+|---|---|
+| `/status` | Active or paused (and until when), last check time, your current appointment, next check time |
+| `/check` | Runs a check right now, even while paused or outside active hours |
+| `/pause` | Pauses until you send `/resume` |
+| `/pause N` | Pauses for N hours, then resumes automatically and lets you know |
+| `/resume` | Cancels the pause |
+
+Any other message gets the list of commands. Every command gets a short confirmation.
+
+- Only messages from your own chat (`TG_CHAT_ID`) are handled. Everything else is ignored.
+- The pause state and the last check time are saved in `state.json`, so they survive a restart.
+- Commands are **not** available with `--once` or `--test-notify`, since those modes don't listen.
+- If the bot was paused or outside active hours when a check was due, the check runs as soon as it's allowed again.
+
 ## Running automatically (Windows Task Scheduler)
 
-The recommended setup is a task that runs `--once` every hour on the hour. If the computer was asleep, the check runs as soon as it wakes up. Run this in PowerShell, after updating the path:
+The recommended setup is a task that starts the bot in continuous mode every time you log in. The bot then checks on its own every `CHECK_EVERY_MIN` minutes and listens for Telegram commands. Run this in PowerShell, after updating the path:
 
 ```powershell
 $dir = "C:\path\to\Clalit_DocSpot"
 $py  = (Get-Command pythonw).Source
-$a = New-ScheduledTaskAction -Execute $py -Argument "clalit_watch.py --once" -WorkingDirectory $dir
-$t = New-ScheduledTaskTrigger -Daily -At 9:00
-$t.Repetition = (New-ScheduledTaskTrigger -Once -At 9:00 -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Hours 9)).Repetition
-$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 45) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$a = New-ScheduledTaskAction -Execute $py -Argument "clalit_watch.py" -WorkingDirectory $dir
+$t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName "Clalit DocSpot" -Action $a -Trigger $t -Settings $s
 ```
 
-- Checks every hour on the hour from 9:00 to 17:00. `pythonw` runs the bot without opening a window.
-- Run now: `Start-ScheduledTask -TaskName "Clalit DocSpot"`
-- Next run time: `Get-ScheduledTaskInfo -TaskName "Clalit DocSpot"`
+- `pythonw` runs the bot without opening a window.
+- Start now: `Start-ScheduledTask -TaskName "Clalit DocSpot"`
+- Stop: `Stop-ScheduledTask -TaskName "Clalit DocSpot"`
 - Remove: `Unregister-ScheduledTask -TaskName "Clalit DocSpot" -Confirm:$false`
 
-The computer must be on and logged in to your user. While it's asleep, no checks run.
+The computer must be on and logged in to your user. While it's asleep, nothing runs. After it wakes up, a check that came due during sleep runs within about a minute.
+
+Don't run two copies of the bot at once (for example, this task plus an hourly `--once` task): they share the same browser profile and Telegram updates.
 
 ## CAPTCHA
 

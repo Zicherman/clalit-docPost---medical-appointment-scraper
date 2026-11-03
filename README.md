@@ -55,7 +55,7 @@ Then copy `env.example.txt` to a file named `env.txt` and fill in your details.
 
 ## Configuration
 
-Settings live at the top of `clalit_watch.py`:
+All settings live in `config.py`. It's the only file you need to edit:
 
 | Setting | What it does | Default |
 |---|---|---|
@@ -127,10 +127,17 @@ Sometimes the Clalit site asks for a CAPTCHA. **The script does not solve it.** 
 ## Project structure
 
 ```
-clalit_watch.py        Main script (settings at the top)
+clalit_watch.py        Entry point: command-line options, starts the bot
+config.py              Your settings (cities, excluded places, specialty, hours)
+env.example.txt        Template for env.txt (login details and Telegram token)
 run_watch.bat          Quick launcher for Windows, passes arguments through (e.g. --once)
-env.example.txt        Template for the env.txt settings file
 requirements.txt
+docspot/
+  common.py            Paths, logging, env.txt and state.json
+  telegram.py          Sending messages and reading updates from Telegram
+  clalit.py            Everything that talks to the Clalit site: browser, login, reading your appointment, searching a city
+  appointments.py      The logic: filtering, comparing to your appointment, building the message, one full check
+  watcher.py           Continuous mode: Telegram commands, check scheduling, keep-alive
 tests/
   test_search.py       Full dry run, sends nothing
   test_search.bat
